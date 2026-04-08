@@ -2,106 +2,117 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>GEDCOM to SurrealDB Converter</title>
+    <title>Advanced GEDCOM to SurrealDB</title>
     <style>
-        body { font-family: sans-serif; max-width: 800px; margin: 2em auto; line-height: 1.6; background: #f4f4f9; }
-        .container { background: white; padding: 2em; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-        textarea { width: 100%; height: 300px; font-family: monospace; margin-top: 1em; padding: 10px; border: 1px solid #ccc; }
-        .controls { margin-bottom: 20px; }
-        button { padding: 10px 20px; cursor: pointer; background: #ff00a0; color: white; border: none; border-radius: 4px; font-weight: bold; }
-        button:hover { background: #e60090; }
-        h2 { color: #333; }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 900px; margin: 2em auto; background: #0f172a; color: #f8fafc; }
+        .card { background: #1e293b; padding: 20px; border-radius: 12px; border: 1px solid #334155; }
+        textarea { width: 100%; height: 400px; font-family: 'Fira Code', monospace; background: #000; color: #10b981; border: 1px solid #334155; margin-top: 20px; padding: 15px; font-size: 12px; }
+        .btn { background: #ff00a0; color: white; padding: 10px 25px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; }
+        .btn:hover { background: #d40085; }
+        input[type="file"] { color: #94a3b8; }
+        h1 { color: #ff00a0; margin-top: 0; }
     </style>
 </head>
 <body>
 
-<div class="container">
-    <h2>GEDCOM to SurrealDB Graph Converter</h2>
-    <p>Upload a <code>.ged</code> file to generate SurrealQL <code>CREATE</code> and <code>RELATE</code> statements.</p>
+<div class="card">
+    <h1>GEDCOM &rarr; SurrealDB</h1>
+    <p>Converts nested GEDCOM records (MAP, BIRT, SOUR, etc.) into a document-graph format.</p>
     
-    <div class="controls">
-        <input type="file" id="fileInput" accept=".ged">
-        <button onclick="processFile()">Convert to SurrealQL</button>
-    </div>
+    <input type="file" id="fileInput" accept=".ged">
+    <button class="btn" onclick="processGedcom()">Generate SurrealQL</button>
 
-    <textarea id="output" readonly placeholder="SurrealQL output will appear here..."></textarea>
+    <textarea id="output" readonly placeholder="SurrealQL script will generate here..."></textarea>
 </div>
 
 <script>
-/**
- * GEDCOM 5.5.1 Parser for SurrealDB
- * This script transforms a hierarchical GEDCOM into a Graph schema:
- * - INDI records become 'person' table records.
- * - FAM records become 'family' table records.
- * - Relationships (HUSB, WIFE, CHIL) become graph edges (e.g., relate person:x -> family:y).
- */
+function gedcomToJSON(lines) {
+    const root = [];
+    const stack = [{ sub: root }];
 
-async function processFile() {
-    const fileInput = document.getElementById('fileInput');
-    const output = document.getElementById('output');
-    
-    if (!fileInput.files.length) {
-        alert("Please select a file first.");
-        return;
-    }
-
-    const text = await fileInput.files[0].text();
-    const lines = text.split(/\r?\n/);
-    
-    let records = [];
-    let current = null;
-    let stack = [];
-
-    // Step 1: Parse GEDCOM into a JSON Tree
     lines.forEach(line => {
         const match = line.match(/^(\d+)\s+(@\w+@)?\s*(\w+)\s*(.*)$/);
         if (!match) return;
 
-        const [_, level, xref, tag, value] = match;
-        const node = { tag, value: value.trim(), xref: xref ? xref.replace(/@/g, '') : null, sub: [] };
+        const level = parseInt(match[1]);
+        const xref = match[2] ? match[2].replace(/@/g, '') : null;
+        const tag = match[3];
+        const value = match[4].trim();
 
-        if (level === '0') {
-            current = node;
-            records.push(current);
-            stack = [current];
+        const node = { tag, value, xref, data: {} };
+        
+        while (stack.length > level + 1) stack.pop();
+        
+        const parent = stack[stack.length - 1];
+        if (!parent.sub) parent.sub = [];
+        parent.sub.push(node);
+        stack.push(node);
+    });
+    return root;
+}
+
+// Recursively builds a clean JSON object from GEDCOM sub-tags
+function buildProperties(nodes) {
+    let obj = {};
+    if (!nodes) return obj;
+
+    nodes.forEach(n => {
+        let key = n.tag.toLowerCase();
+        // Handle coordinates and nested objects
+        if (n.sub && n.sub.length > 0) {
+            obj[key] = buildProperties(n.sub);
+            if (n.value) obj[key].val = n.value;
         } else {
-            while (stack.length > level) stack.pop();
-            if (stack[stack.length - 1]) {
-                stack[stack.length - 1].sub.push(node);
-                stack.push(node);
+            obj[key] = n.value;
+        }
+    });
+    return obj;
+}
+
+async function processGedcom() {
+    const fileInput = document.getElementById('fileInput');
+    if (!fileInput.files.length) return alert("Select file");
+
+    const text = await fileInput.files[0].text();
+    const jsonTree = gedcomToJSON(text.split(/\r?\n/));
+    let sql = "-- Export Generated for SurrealDB\n\n";
+
+    jsonTree.forEach(record => {
+        const props = buildProperties(record.sub);
+        const id = record.xref || `gen_${Math.random().toString(36).substr(2, 9)}`;
+
+        if (record.tag === 'INDI') {
+            // Flatten Name for easier search, keep details in object
+            const name = props.name?.val || props.name || "Unknown";
+            sql += `CREATE person:${id} CONTENT ${JSON.stringify({
+                name: name.replace(/\//g, ''),
+                details: props,
+                source: "gedcom_import"
+            }, null, 2)};\n`;
+        } 
+        else if (record.tag === 'FAM') {
+            sql += `CREATE family:${id} CONTENT ${JSON.stringify(props, null, 2)};\n`;
+            
+            // Generate Edges
+            if (props.husb) sql += `RELATE person:${props.husb} -> parent_of -> family:${id};\n`;
+            if (props.wife) sql += `RELATE person:${props.wife} -> parent_of -> family:${id};\n`;
+            
+            // Children can be multiple, handle if it's an array or single
+            if (props.chil) {
+                const children = Array.isArray(props.chil) ? props.chil : [props.chil];
+                children.forEach(c => {
+                    const cid = typeof c === 'string' ? c : c.val;
+                    sql += `RELATE person:${cid.replace(/@/g,'')} -> child_of -> family:${id};\n`;
+                });
             }
         }
-    });
-
-    // Step 2: Generate SurrealQL
-    let surrealql = "-- SurrealDB Genealogy Graph Export\n\n";
-
-    records.forEach(rec => {
-        if (rec.tag === 'INDI') {
-            const name = rec.sub.find(s => s.tag === 'NAME')?.value || "Unknown";
-            const sex = rec.sub.find(s => s.tag === 'SEX')?.value || "U";
-            // Create the person node
-            surrealql += `CREATE person:${rec.xref} SET name = "${name.replace(/\//g, '')}", sex = "${sex}";\n`;
-        } 
-        
-        else if (rec.tag === 'FAM') {
-            surrealql += `CREATE family:${rec.xref} SET type = "union";\n`;
-            
-            // Create relationships (Edges)
-            rec.sub.forEach(sub => {
-                const targetId = sub.value.replace(/@/g, '');
-                if (sub.tag === 'HUSB' || sub.tag === 'WIFE') {
-                    surrealql += `RELATE person:${targetId} -> parent_of -> family:${rec.xref} SET role = "${sub.tag}";\n`;
-                } else if (sub.tag === 'CHIL') {
-                    surrealql += `RELATE person:${targetId} -> child_of -> family:${rec.xref};\n`;
-                }
-            });
+        else if (record.tag === 'SUBM') {
+            sql += `CREATE submitter:${id} CONTENT ${JSON.stringify(props, null, 2)};\n`;
         }
     });
 
-    output.value = surrealql;
+    document.getElementById('output').value = sql;
 }
 </script>
-
 </body>
 </html>
